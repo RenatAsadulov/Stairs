@@ -4,6 +4,8 @@ import fsp from "fs/promises";
 import path from "path";
 import dotenv from "dotenv";
 import { ChartJSNodeCanvas } from "chartjs-node-canvas";
+import "chartjs-adapter-date-fns";
+import { uk } from "date-fns/locale";
 
 dotenv.config();
 
@@ -12,6 +14,8 @@ if (!BOT_TOKEN) {
   console.error("BOT_TOKEN is missing. Put it in .env");
   process.exit(1);
 }
+
+const pendingNumber = new Map();
 
 const DATA_FILE = process.env.DATA_FILE || "./data/users.json";
 const CHART_DAYS = Math.max(
@@ -54,6 +58,10 @@ const awaitingName = new Set();
 const todayKey = () => new Date().toISOString().slice(0, 10);
 const pad = (s, w) => (s.length >= w ? s : s + " ".repeat(w - s.length));
 
+function escapeM2(s = "") {
+  return s.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
+}
+
 let writeQueue = Promise.resolve();
 function saveDb() {
   writeQueue = writeQueue
@@ -65,6 +73,15 @@ function saveDb() {
     })
     .catch((e) => console.error("Save error:", e));
   return writeQueue;
+}
+
+function colorFromSeed(seed) {
+  // детерминированный «рандом» от userId
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  // пастельные, но контрастные
+  return `hsl(${hue}, 70%, 55%)`;
 }
 
 function isRegistered(userId) {
@@ -100,30 +117,53 @@ function listUsers() {
   return Object.entries(db.users).map(([id, u]) => ({ id, ...u }));
 }
 
-function makeLeaderboardText(users) {
+function makeLeaderboardText(users, meId) {
   if (users.length === 0)
     return "Ще немає даних. Додайте сходи командою /stairs <кількість>.";
 
   const sorted = [...users].sort((a, b) => b.total - a.total);
   const nameWidth = Math.max(4, ...sorted.map((u) => u.name.length));
   const totalWidth = Math.max(5, ...sorted.map((u) => String(u.total).length));
+
   const header = "🏆 Загальна статистика (усього)";
-  const sep = "─".repeat(nameWidth + totalWidth + 7);
+  const sep = "─".repeat(nameWidth + totalWidth + 10);
+
   const lines = [
     "```\n" + header,
     sep,
-    `${pad("Імʼя", nameWidth)} | ${pad("Сходи", totalWidth)}`,
-    `${"─".repeat(nameWidth)}-+-${"─".repeat(totalWidth)}`,
+    `${pad("Імʼя", nameWidth)} | ${pad("Сходи", totalWidth)} | `,
+    `${"─".repeat(nameWidth)}-+-${"─".repeat(totalWidth)}-+-`,
   ];
+
   for (const u of sorted) {
+    const mark = u.id === meId ? "★" : " ";
     lines.push(
-      `${pad(u.name, nameWidth)} | ${pad(String(u.total), totalWidth)}`
+      `${pad(u.name, nameWidth)} | ${pad(
+        String(u.total),
+        totalWidth
+      )} | ${mark}`
     );
   }
+
   const sum = sorted.reduce((acc, u) => acc + (u.total || 0), 0);
-  lines.push(`${"-".repeat(nameWidth)}-+-${"-".repeat(totalWidth)}`);
-  lines.push(`${pad("Разом", nameWidth)} | ${pad(String(sum), totalWidth)}`);
+  lines.push(`${"-".repeat(nameWidth)}-+-${"-".repeat(totalWidth)}-+-`);
+  lines.push(`${pad("Разом", nameWidth)} | ${pad(String(sum), totalWidth)} | `);
   lines.push("```");
+  return lines.join("\n");
+}
+
+function makeLeaderboardTextMD(users, meId) {
+  if (users.length === 0)
+    return "Ще немає даних. Додайте сходи командою /stairs <кількість>.";
+  const sorted = [...users].sort((a, b) => b.total - a.total);
+
+  const lines = ["🏆 Загальна статистика (усього)"];
+  for (const u of sorted) {
+    const name = u.id === meId ? `*${escapeM2(u.name)}*` : escapeM2(u.name);
+    lines.push(`${name} — ${u.total}`);
+  }
+  const sum = sorted.reduce((s, u) => s + (u.total || 0), 0);
+  lines.push(`Разом — ${sum}`);
   return lines.join("\n");
 }
 
@@ -173,38 +213,68 @@ async function renderChart(users, { startISO, endISO, lastNDays } = {}) {
     lastNDays,
   });
 
-  const datasets = users.map((u, idx) => ({
-    label: u.name,
-    data: series[idx],
-    borderColor: randomNiceColor(u.id),
-    backgroundColor: "rgba(0,0,0,0)",
-    borderWidth: 3,
-    tension: 0.35,
-    pointRadius: 0,
-  }));
+  // 1) Найдём максимальное дневное значение (до каскада)
+  let maxDay = 0;
+  for (const arr of series) for (const v of arr) if (v > maxDay) maxDay = v;
 
+  // 2) Шаг каскада: env или ~5% от max (но не меньше 1)
+  const CASCADE_STEP =
+    Number(process.env.CASCADE_STEP) > 0
+      ? Number(process.env.CASCADE_STEP)
+      : Math.max(1, Math.round(maxDay * 0.05));
+
+  // 3) Превращаем ряды в точки {x, y} и добавляем каскад
+  const datasets = users.map((u, idx) => {
+    const offset = idx * CASCADE_STEP;
+    const points = labels.map((iso, i) => ({
+      x: iso, // ISO-дата
+      y: (series[idx][i] || 0) + offset, // сплошной график: 0 там где нет данных + каскад
+    }));
+    return {
+      label: u.name,
+      data: points,
+      borderColor: colorFromSeed(u.id),
+      backgroundColor: "rgba(0,0,0,0)",
+      borderWidth: 3,
+      tension: 0.3,
+      pointRadius: 0,
+      spanGaps: true, // на всякий случай, но мы уже дали 0 вместо null
+    };
+  });
+
+  // 4) Заголовок
   const titleText =
     startISO && endISO
-      ? `Динаміка ${formatDM(startISO)}–${formatDM(endISO)}`
-      : `Динаміка за ${lastNDays ?? CHART_DAYS} днів`;
+      ? `Динаміка ${formatDM(startISO)}–${formatDM(endISO)} (каскад)`
+      : `Динаміка за ${lastNDays ?? CHART_DAYS} днів (каскад)`;
+
+  // 5) Оценим верхнюю границу по оси Y с запасом под каскад
+  const cascadeTop = maxDay + CASCADE_STEP * (users.length - 1);
+  const suggestedMax = cascadeTop > 0 ? cascadeTop * 1.1 : 10;
 
   const configuration = {
     type: "line",
-    data: { labels, datasets },
+    data: { datasets },
     options: {
       responsive: false,
       maintainAspectRatio: false,
       scales: {
         x: {
-          grid: { display: false },
-          ticks: {
-            maxRotation: 0,
-            autoSkip: true,
-            maxTicksLimit: 12,
-            callback: (value, idx) => formatDM(labels[idx]),
+          type: "time", // настоящая временная ось
+          time: {
+            unit: "day",
+            tooltipFormat: "dd.MM.yyyy",
+            displayFormats: { day: "dd.MM" },
           },
+          adapters: { date: { locale: uk } },
+          grid: { display: false },
         },
-        y: { beginAtZero: true, grid: { color: "#eee" } },
+        y: {
+          beginAtZero: true,
+          grid: { color: "#eee" },
+          grace: "10%",
+          suggestedMax,
+        },
       },
       plugins: {
         legend: { position: "bottom" },
@@ -223,13 +293,13 @@ bot.start(async (ctx) => {
   const existing = db.users[userId];
   if (existing?.name) {
     awaitingName.delete(userId);
-    await ctx.reply(`👋 Вітаю знову, ${existing.name}!`);
+    await ctx.reply(`👋 Вітаю знову, ${existing.name}!`, userKeyboard());
     return sendInfo(ctx);
   }
   awaitingName.add(userId);
   await ctx.reply(
     "Привіт! Я бот для підрахунку сходів.\n" +
-      'Напишіть, будь ласка, ваше імʼя одним повідомленням (наприклад: "Ренат"). ' +
+      'Напишіть, будь ласка, ваше імʼя одним повідомленням (наприклад: "Вадим"). ' +
       "Після цього стануть доступні команди."
   );
 });
@@ -292,42 +362,100 @@ bot.command("stat", async (ctx) => {
   await ctx.reply(text, { parse_mode: "MarkdownV2" }).catch(async () => {
     await ctx.reply(text.replace(/```/g, ""));
   });
-
-  try {
-    const png = await renderChart(
-      users,
-      useFixed ? { startISO, endISO } : { lastNDays: CHART_DAYS }
-    );
-    const caption = useFixed
-      ? `Динаміка по днях (${formatDM(startISO)}–${formatDM(endISO)})`
-      : `Динаміка по днях (останні ${CHART_DAYS} днів)`;
-    await ctx.replyWithPhoto({ source: Buffer.from(png) }, { caption });
-  } catch (e) {
-    console.error("Chart render error:", e);
-    await ctx.reply("Не вдалося згенерувати графік 😓");
-  }
 });
 
 // capture name after /start
-bot.on("text", async (ctx) => {
-  console.log("TEXT");
+bot.on("text", async (ctx, next) => {
   const userId = String(ctx.from.id);
-  if (!awaitingName.has(userId)) return;
+  const msg = (ctx.message.text || "").trim();
 
-  const raw = (ctx.message.text || "").trim();
-  if (raw.length < 2 || raw.length > 40) {
-    return ctx.reply("Імʼя має бути від 2 до 40 символів. Спробуйте ще раз.");
+  if (awaitingName.has(userId)) {
+    // блокируем все команды, пока имя не указано
+    if (msg.startsWith("/")) {
+      await ctx.reply(
+        'Спочатку введіть імʼя одним повідомленням (наприклад: "Ренат"). Команди поки недоступні.'
+      );
+      return;
+    }
+
+    if (msg.length < 2 || msg.length > 40) {
+      await ctx.reply("Імʼя має бути від 2 до 40 символів. Спробуйте ще раз.");
+      return;
+    }
+
+    const now = new Date().toISOString();
+    db.users[userId] = db.users[userId] || {
+      name: msg,
+      total: 0,
+      days: {},
+      updatedAt: now,
+    };
+    db.users[userId].name = msg;
+    db.users[userId].updatedAt = now;
+    awaitingName.delete(userId);
+    await saveDb();
+
+    await ctx.reply(
+      `✅ Дякую, ${msg}! Тепер вам доступні команди.`,
+      userKeyboard()
+    );
+    await sendInfo(ctx);
+    return; // имя обработали — дальше не идём
   }
-  db.users[userId] = {
-    name: raw,
-    total: 0,
-    days: {},
-    updatedAt: new Date().toISOString(),
-  };
-  awaitingName.delete(userId);
-  await saveDb();
-  await ctx.reply(`✅ Дякую, ${raw}! Тепер вам доступні команди.\n`);
-  return sendInfo(ctx);
+
+  // если ждём число после кнопки
+  if (pendingNumber.has(userId) && !msg.startsWith("/")) {
+    const { mode } = pendingNumber.get(userId);
+    pendingNumber.delete(userId);
+
+    // валидация числа
+    const n = Number(msg);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+      return ctx.reply("Потрібне додатне ціле число. Спробуйте ще раз.");
+    }
+
+    const iso = todayKey();
+    db.users[userId] ||= {
+      name: ctx.from.username || "Без імені",
+      total: 0,
+      days: {},
+      updatedAt: new Date().toISOString(),
+    };
+    const u = db.users[userId];
+    u.days ||= {};
+    const todayVal = u.days[iso] || 0;
+
+    if (mode === "add") {
+      // как /stairs
+      u.days[iso] = todayVal + n;
+      u.total = Object.values(u.days).reduce((a, v) => a + (v || 0), 0);
+      u.updatedAt = new Date().toISOString();
+      await saveDb();
+      return ctx.reply(
+        `✅ Додано ${n}. За сьогодні: ${u.days[iso]} | Всього: ${u.total}`,
+        userKeyboard()
+      );
+    } else {
+      // sub: вычитаем только из СЕГОДНЯ, и не даём уйти в минус
+      if (n > todayVal) {
+        return ctx.reply(
+          "Операція неможлива — за сьогодні менше сходів, ніж ви хочете відняти.",
+          userKeyboard()
+        );
+      }
+      u.days[iso] = todayVal - n; // может стать 0 — это ок
+      u.total = Object.values(u.days).reduce((a, v) => a + (v || 0), 0);
+      u.updatedAt = new Date().toISOString();
+      await saveDb();
+      return ctx.reply(
+        `➖ Віднято ${n}. За сьогодні: ${u.days[iso]} | Всього: ${u.total}`,
+        userKeyboard()
+      );
+    }
+  }
+
+  // если число не ожидали — передаём дальше (например, обработчик имени)
+  return next();
 });
 
 bot.command("/update", async (ctx) => {
@@ -445,6 +573,82 @@ bot.command("/list", async (ctx) => {
   }
 });
 
+// "+ Этаж" — просим число, потом добавим как /stairs
+bot.hears("+ Поверх", async (ctx) => {
+  if (!requireRegistered(ctx)) return;
+  const userId = String(ctx.from.id);
+  pendingNumber.set(userId, { mode: "add" });
+
+  // Телеграм НЕ даёт включить «цифровую» клавиатуру программно,
+  // но force_reply переносит фокус в поле ввода.
+  await ctx.reply("➕", {
+    reply_markup: { force_reply: true, input_field_placeholder: "Напр.: 120" },
+  });
+});
+
+// "- Этаж" — просим число, потом вычтем из сегодняшнего дня
+bot.hears("- Поверх", async (ctx) => {
+  if (!requireRegistered(ctx)) return;
+  const userId = String(ctx.from.id);
+  pendingNumber.set(userId, { mode: "sub" });
+
+  await ctx.reply("➖", {
+    reply_markup: {
+      force_reply: true,
+      input_field_placeholder: "Наприклад: 20",
+    },
+  });
+});
+
+// "Результат" — как /stat, но отправитель САМЫЙ ВВЕРХ и жирным
+bot.hears("Результат", async (ctx) => {
+  if (!requireRegistered(ctx)) return;
+
+  const meId = String(ctx.from.id);
+  const users = listUsers();
+
+  const text = makeLeaderboardText(users, meId);
+  // переставим текущего пользователя наверх
+  const me = users.find((u) => u.id === meId);
+  const others = users.filter((u) => u.id !== meId);
+  // сортируем остальных по total ↓
+  others.sort((a, b) => b.total - a.total);
+  const ordered = [me, ...others].filter(Boolean);
+
+  // делаем «таблицу» и жирным только первую строку (MarkdownV2, без моноширинного блока)
+  const rows = ordered.map((u, idx) => {
+    const name = idx === 0 ? `*${escapeM2(u.name)}*` : escapeM2(u.name);
+    return `${name} — ${u.total}`;
+  });
+  const table = `🏆 Загальна статистика (усього) \n` + rows.join("\n");
+
+  try {
+    await ctx.reply(text, { parse_mode: "MarkdownV2" }, userKeyboard());
+  } catch {
+    await ctx.reply(table, userKeyboard());
+  }
+});
+
+// "По дням" — твой /list, но вызываем по кнопке
+bot.hears("По дням", async (ctx) => {
+  if (!requireRegistered(ctx)) return;
+
+  const userId = String(ctx.from.id);
+  const u = db.users[userId];
+
+  const entries = Object.entries(u.days || {}).sort((a, b) =>
+    a[0] < b[0] ? -1 : 1
+  );
+  if (entries.length === 0)
+    return ctx.reply("Ще немає щоденних записів.", userKeyboard());
+
+  const lines = ["Дата  ||  Кількість", "────────┆──────────"];
+  for (const [iso, v] of entries) lines.push(`${formatDM(iso)}  ||  ${v || 0}`);
+
+  // MarkdownV2 иногда «спотыкается» — отправим просто текстом
+  await ctx.reply(lines.join("\n"), userKeyboard());
+});
+
 // lifecycle
 bot.launch().then(() => console.log("Stairs bot is running with daily stats."));
 
@@ -470,6 +674,20 @@ async function ensureDataFile(filePath) {
     const empty = { users: {}, createdAt: now, updatedAt: now, version: 2 };
     await fsp.writeFile(filePath, JSON.stringify(empty, null, 2));
   }
+}
+
+function userKeyboard() {
+  return {
+    reply_markup: {
+      keyboard: [
+        [{ text: "+ Поверх" }, { text: "Результат" }],
+        [{ text: "- Поверх" }, { text: "По дням" }],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false,
+      input_field_placeholder: "Введіть команду або число…",
+    },
+  };
 }
 
 function toISODate(d) {
@@ -552,14 +770,6 @@ async function readDbV2() {
 }
 
 async function sendInfo(ctx) {
-  const text =
-    "ℹ️ Доступні команди:\n" +
-    "• /start — почати роботу і вказати імʼя.\n" +
-    "• /info — список команд і пояснення.\n" +
-    "• /stairs <кількість> — додати кількість пройдених сходів **сьогодні**.\n" +
-    `• /stat — показати таблицю загальних результатів та графік за останні ${CHART_DAYS} днів.\n\n` +
-    "• /update <дата> <кількість> — змінити значення за день (можна віднімати, напр.: /update 27.10 -2)\n" +
-    "• /list — показати ваші щоденні значення по датах\n" +
-    "Примітка: бот зберігає дані **помесячно по днях** у локальному файлі JSON. Якщо потрібні окремі періоди або експорт — скажіть 😉";
+  const text = "ℹ️ Вітаю! Час ходити сходами :)";
   return ctx.reply(text, { parse_mode: "Markdown" });
 }
