@@ -24,11 +24,6 @@ await ensureDataFile(DATA_FILE);
 
 const WIDTH = 1200;
 const HEIGHT = 700;
-const chartCanvas = new ChartJSNodeCanvas({
-  width: WIDTH,
-  height: HEIGHT,
-  backgroundColour: "white",
-});
 
 /**
  * DB shape v2:
