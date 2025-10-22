@@ -3,9 +3,6 @@ import fs from "fs";
 import fsp from "fs/promises";
 import path from "path";
 import dotenv from "dotenv";
-import { ChartJSNodeCanvas } from "chartjs-node-canvas";
-import "chartjs-adapter-date-fns";
-import { uk } from "date-fns/locale";
 
 dotenv.config();
 
@@ -204,87 +201,6 @@ function randomNiceColor(seed) {
   let h = 0;
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
   return palette[h % palette.length];
-}
-
-async function renderChart(users, { startISO, endISO, lastNDays } = {}) {
-  const { labels, series } = buildDailySeries(users, {
-    startISO,
-    endISO,
-    lastNDays,
-  });
-
-  // 1) Найдём максимальное дневное значение (до каскада)
-  let maxDay = 0;
-  for (const arr of series) for (const v of arr) if (v > maxDay) maxDay = v;
-
-  // 2) Шаг каскада: env или ~5% от max (но не меньше 1)
-  const CASCADE_STEP =
-    Number(process.env.CASCADE_STEP) > 0
-      ? Number(process.env.CASCADE_STEP)
-      : Math.max(1, Math.round(maxDay * 0.05));
-
-  // 3) Превращаем ряды в точки {x, y} и добавляем каскад
-  const datasets = users.map((u, idx) => {
-    const offset = idx * CASCADE_STEP;
-    const points = labels.map((iso, i) => ({
-      x: iso, // ISO-дата
-      y: (series[idx][i] || 0) + offset, // сплошной график: 0 там где нет данных + каскад
-    }));
-    return {
-      label: u.name,
-      data: points,
-      borderColor: colorFromSeed(u.id),
-      backgroundColor: "rgba(0,0,0,0)",
-      borderWidth: 3,
-      tension: 0.3,
-      pointRadius: 0,
-      spanGaps: true, // на всякий случай, но мы уже дали 0 вместо null
-    };
-  });
-
-  // 4) Заголовок
-  const titleText =
-    startISO && endISO
-      ? `Динаміка ${formatDM(startISO)}–${formatDM(endISO)} (каскад)`
-      : `Динаміка за ${lastNDays ?? CHART_DAYS} днів (каскад)`;
-
-  // 5) Оценим верхнюю границу по оси Y с запасом под каскад
-  const cascadeTop = maxDay + CASCADE_STEP * (users.length - 1);
-  const suggestedMax = cascadeTop > 0 ? cascadeTop * 1.1 : 10;
-
-  const configuration = {
-    type: "line",
-    data: { datasets },
-    options: {
-      responsive: false,
-      maintainAspectRatio: false,
-      scales: {
-        x: {
-          type: "time", // настоящая временная ось
-          time: {
-            unit: "day",
-            tooltipFormat: "dd.MM.yyyy",
-            displayFormats: { day: "dd.MM" },
-          },
-          adapters: { date: { locale: uk } },
-          grid: { display: false },
-        },
-        y: {
-          beginAtZero: true,
-          grid: { color: "#eee" },
-          grace: "10%",
-          suggestedMax,
-        },
-      },
-      plugins: {
-        legend: { position: "bottom" },
-        title: { display: true, text: titleText },
-      },
-      animation: false,
-    },
-  };
-
-  return chartCanvas.renderToBuffer(configuration, "image/png");
 }
 
 // ------- commands -------
