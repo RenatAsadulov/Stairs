@@ -38,9 +38,17 @@ const HEIGHT = 700;
  *   },
  *   createdAt: ISOString,
  *   updatedAt: ISOString,
- *   version: 2
+ *   version: 2,
+ *   season: number,
+ *   announce: { pending: [telegramUserId] } // ще не отримали анонс сезону
  * }
  */
+const SEASON = 2;
+const SEASON_ANNOUNCE_TEXT =
+  'Вітаю тебе у другому сезоні "Сходів". Цього разу ми йдемо на гору Фудзі, це всього ~1260 поверхів. Тож не зволікай, доєднуйся, буде багато цікавого!';
+const SEASON_IMAGE = new URL("./assets/fuji.jpg", import.meta.url).pathname;
+let seasonImageFileId = null; // після першого завантаження шлемо по file_id
+
 let db = await readDbV2();
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -198,6 +206,8 @@ function randomNiceColor(seed) {
   return palette[h % palette.length];
 }
 
+await startNewSeasonIfNeeded();
+
 // ------- commands -------
 bot.start(async (ctx) => {
   const userId = String(ctx.from.id);
@@ -208,17 +218,35 @@ bot.start(async (ctx) => {
     return sendInfo(ctx);
   }
   awaitingName.add(userId);
-  await ctx.reply(
-    "Привіт!👋 Я бот для підрахунку пройдених поверхів.\n \n" +
-      'Напишіть, будь ласка, ваше імʼя одним повідомленням (наприклад: "Вадим"). \n \n' +
-      "Вводячи своє імʼя Ви погоджуєтесь на умови челенджу: \n \n" +
-      `- Ціль - 1000 поверхів(лише вгору), до 1 січня 2026 року \n` +
-      "- В разі НЕвиконання челенджу, ті хто не виконав - купляють разом тортк і ми всі його їмо \n" +
-      "- Якщо всі виконають - всі разом купляють тортик \n" +
-      "Наприклад: млинцевий торт з фісташкою 😊 \n \n" +
-      "❗️❗️❗️ Здаватись ЗАБОРОНЕНО ❗️❗️❗️"
+  await sendSeasonPhoto(
+    ctx.chat.id,
+    'Вітаю тебе у другому сезоні "Сходів". Цього разу ми йдемо на гору Фудзі, це всього ~1260 поверхів. Тож не зволікай, доєднуйся, буде багато цікавого!\n\n' +
+      "Введіть Ваше імʼя, щоб ми знали на якій висоті вас шукати. Нехай щасти!"
   );
 });
+
+// /join — реєстрація у новому сезоні (посилання з анонсу)
+bot.command("join", (ctx) => joinSeason(ctx));
+
+// кнопка "Долучитись" під анонсом
+bot.action("join", async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  return joinSeason(ctx);
+});
+
+async function joinSeason(ctx) {
+  const userId = String(ctx.from.id);
+  const existing = db.users[userId];
+  if (existing?.name) {
+    awaitingName.delete(userId);
+    await ctx.reply(`👋 Ви вже у челенджі, ${existing.name}!`, userKeyboard());
+    return;
+  }
+  awaitingName.add(userId);
+  await ctx.reply(
+    "Введіть Ваше імʼя, щоб ми знали на якій висоті вас шукати. Нехай щасти!"
+  );
+}
 
 bot.command("info", (ctx) => sendInfo(ctx));
 
@@ -566,7 +594,8 @@ bot.hears("По дням", async (ctx) => {
 });
 
 // lifecycle
-bot.launch().then(() => console.log("Stairs bot is running with daily stats."));
+bot.launch(() => console.log("Stairs bot is running with daily stats."));
+sendSeasonAnnounce();
 
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
@@ -683,6 +712,67 @@ async function readDbV2() {
     await fsp.writeFile(DATA_FILE, JSON.stringify(seed, null, 2));
     return seed;
   }
+}
+
+// Новий сезон: архівуємо стару базу, очищаємо користувачів
+// і запамʼятовуємо, кому треба надіслати анонс.
+async function startNewSeasonIfNeeded() {
+  if ((db.season || 1) >= SEASON) return;
+
+  const oldIds = Object.keys(db.users);
+  const archive = DATA_FILE.replace(/\.json$/, "") + `.season${db.season || 1}.json`;
+  await fsp.writeFile(archive, JSON.stringify(db, null, 2));
+
+  const now = new Date().toISOString();
+  db = {
+    users: {},
+    createdAt: now,
+    updatedAt: now,
+    version: 2,
+    season: SEASON,
+    announce: { pending: oldIds },
+  };
+  await saveDb();
+  console.log(
+    `Season ${SEASON} started. Old DB archived to ${archive}, ${oldIds.length} users to notify.`
+  );
+}
+
+// Розсилка анонсу; кожного прибираємо з черги одразу після спроби,
+// тож після перезапуску повторно ніхто не отримає повідомлення.
+async function sendSeasonAnnounce() {
+  const pending = db.announce?.pending || [];
+  let sent = 0;
+  while (pending.length) {
+    const userId = pending[0];
+    try {
+      await sendSeasonPhoto(userId, SEASON_ANNOUNCE_TEXT, {
+        reply_markup: {
+          inline_keyboard: [[{ text: "Долучитись", callback_data: "join" }]],
+        },
+      });
+      sent++;
+    } catch (e) {
+      if (e?.response?.error_code === 429) {
+        const wait = (e.response.parameters?.retry_after || 5) * 1000;
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      console.error(`Announce to ${userId} failed:`, e?.description || e);
+    }
+    pending.shift();
+    await saveDb();
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (sent) console.log(`Season announce sent to ${sent} users.`);
+}
+
+// Фото Фудзі з підписом
+async function sendSeasonPhoto(chatId, caption, extra = {}) {
+  const photo = seasonImageFileId || { source: SEASON_IMAGE };
+  const msg = await bot.telegram.sendPhoto(chatId, photo, { caption, ...extra });
+  seasonImageFileId ||= msg.photo?.at(-1)?.file_id || null;
+  return msg;
 }
 
 async function sendInfo(ctx) {
